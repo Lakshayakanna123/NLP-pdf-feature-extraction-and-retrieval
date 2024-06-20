@@ -1,0 +1,271 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import re
+import threading
+import keyboard
+import pyperclip
+import time
+
+class PDFTextExtractorApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("PDF Text Extractor")
+        self.text = ""
+        self.pdf_loaded = False
+        self.section_dict = {}
+        self.acronym_dict = {}
+        self.model = None
+        self.util = None
+        self.create_widgets()
+        self.create_menu()
+        self.create_context_menu()
+        self.setup_hotkey_listener()
+
+    def create_widgets(self):
+        self.text_box = tk.Text(self.root, wrap='word')
+        self.text_box.pack(expand=True, fill='both')
+
+        self.scrollbar = tk.Scrollbar(self.text_box)
+        self.scrollbar.pack(side='right', fill='y')
+        self.scrollbar.config(command=self.text_box.yview)
+        self.text_box.config(yscrollcommand=self.scrollbar.set)
+
+        self.text_box.bind("<Button-3>", self.show_context_menu)
+
+    def create_menu(self):
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Open", command=self.open_pdf)
+        file_menu.add_command(label="Exit", command=self.root.quit)
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        search_menu = tk.Menu(menubar, tearoff=0)
+        search_menu.add_command(label="Search...", command=self.search_text)
+        search_menu.add_command(label="Show Stored Sections", command=self.show_stored_sections)
+        menubar.add_cascade(label="Search", menu=search_menu)
+
+    def create_context_menu(self):
+        self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label="Search", command=self.search_selected_text)
+
+    def extract_text_from_pdf(self, pdf_path):
+        try:
+            import fitz  # Lazy import fitz (PyMuPDF)
+            doc = fitz.open(pdf_path)
+            text = "".join([page.get_text("text") for page in doc])
+            return text
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to extract text from PDF: {e}")
+            return ""
+
+    def open_pdf(self):
+        pdf_path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
+        if pdf_path:
+            threading.Thread(target=self.load_pdf, args=(pdf_path,)).start()
+
+    def load_pdf(self, pdf_path):
+        self.text = self.extract_text_from_pdf(pdf_path)
+        if self.text:
+            self.index_sections()
+            self.show_text(self.text)
+            self.pdf_loaded = True
+
+    def show_text(self, text):
+        self.text_box.config(state=tk.NORMAL)
+        self.text_box.delete('1.0', tk.END)
+        self.text_box.insert('1.0', text)
+        self.text_box.config(state=tk.DISABLED)
+
+    def index_sections(self):
+        self.section_dict.clear()
+        self.acronym_dict.clear()
+        section_positions = [m.start() for m in re.finditer(r'\bSECTION\b', self.text)]
+        renumbered_index = 1
+
+        for i, pos in enumerate(section_positions):
+            start_index = pos
+            end_index = section_positions[i + 1] if i + 1 < len(section_positions) else len(self.text)
+            section_text = self.text[start_index:end_index]
+            lines = section_text.split('\n')
+
+            if len(lines) > 200:
+                self.section_dict[renumbered_index] = section_text
+                first_five_lines = "\n".join(lines[1:6])
+                self.store_acronym(renumbered_index, first_five_lines)
+                renumbered_index += 1
+
+        if self.model is None:
+            try:
+                from sentence_transformers import SentenceTransformer, util
+                self.model = SentenceTransformer('bert-base-nli-mean-tokens')
+                self.util = util
+            except ImportError:
+                messagebox.showerror("Error", "Failed to import SentenceTransformer. Please install the library.")
+                return
+
+        for section_number, data in self.acronym_dict.items():
+            data['embedding'] = self.model.encode(data['acronym'])
+
+    def store_acronym(self, section_number, text):
+        words = re.findall(r'\b\w+\b', text)
+        if words:
+            acronym = "".join(word[0].upper() for word in words if word.lower() != 'of')
+            self.acronym_dict[section_number] = {'acronym': acronym, 'text': text}
+
+    def search_text(self):
+        search_window = tk.Toplevel(self.root)
+        search_window.title("Search")
+
+        tk.Label(search_window, text="Enter section (optional):").pack()
+        search_entry = tk.Entry(search_window)
+        search_entry.pack()
+
+        tk.Label(search_window, text="Enter topic number:").pack()
+        topic_entry = tk.Entry(search_window)
+        topic_entry.pack()
+
+        def search():
+            section_query = search_entry.get()
+            topic_query = topic_entry.get()
+            if topic_query and re.match(r'^\d+(\.\d+)*$', topic_query):
+                if section_query:
+                    section_text = self.perform_similarity_search(section_query)
+                    topic_text = self.extract_topic_text(section_text, topic_query)
+                else:
+                    topic_text = self.extract_topic_text_from_all_sections(topic_query)
+                self.show_search_result(topic_text)
+
+        tk.Button(search_window, text="Search", command=search).pack()
+
+    def perform_similarity_search(self, query):
+        if self.model is None:
+            try:
+                from sentence_transformers import SentenceTransformer, util
+                self.model = SentenceTransformer('bert-base-nli-mean-tokens')
+                self.util = util
+            except ImportError:
+                messagebox.showerror("Error", "Failed to import SentenceTransformer. Please install the library.")
+                return ""
+
+        query_embedding = self.model.encode(query)
+        similarities = {}
+        for section_number, data in self.acronym_dict.items():
+            section_embedding = data['embedding']
+            similarity = self.util.pytorch_cos_sim(query_embedding, section_embedding)[0][0].item()
+            if query.upper() in data['acronym']:
+                similarity += 0.1
+            similarities[section_number] = similarity
+
+        most_similar_section = max(similarities, key=similarities.get)
+        return self.section_dict.get(most_similar_section, "")
+
+    def extract_topic_text(self, section_text, topic):
+        lines = section_text.split('\n')
+        search_result = ""
+        for i, line in enumerate(lines):
+            if line.strip().startswith(topic.strip()):
+                start_index = i
+                if start_index + 1 < len(lines) and (lines[start_index + 1].count('.') > 6 or line.count('.') > 6):
+                    continue  # Skip this encounter if the current or next line has more than 6 dots
+
+                end_index = start_index + 1
+                while end_index < len(lines) and not re.match(r'^\d+\.\d\t\t', lines[end_index].strip()):
+                    end_index += 1
+                extracted_text = "\n".join(lines[start_index:end_index])
+                if len(extracted_text.split('\n')) < 3:
+                    return extracted_text + "\n" + "\n".join(lines[end_index:])
+                return extracted_text
+        return search_result
+
+    def extract_topic_text_from_all_sections(self, topic):
+        search_result = ""
+        for section_text in self.section_dict.values():
+            lines = section_text.split('\n')
+            for i, line in enumerate(lines):
+                if line.strip().startswith(topic.strip()):
+                    start_index = i
+                    end_index = start_index + 1
+                    while end_index < len(lines) and not re.match(r'^\d+\.\d', lines[end_index].strip()):
+                        end_index += 1
+                    search_result += "\n".join(lines[start_index:end_index]) + "\n\n"
+                    return search_result
+        return search_result
+
+    def show_search_result(self, result):
+        if self.pdf_loaded:
+            result_window = tk.Toplevel(self.root)
+            result_window.title("Search Result")
+            result_window.geometry("600x150")
+
+            result_frame = tk.Frame(result_window)
+            result_frame.pack(expand=True, fill='both')
+
+            result_text_box = tk.Text(result_frame, wrap='word')
+            result_text_box.pack(expand=True, fill='both')
+
+            scrollbar = tk.Scrollbar(result_frame, command=result_text_box.yview)
+            scrollbar.pack(side='right', fill='y')
+            result_text_box.config(yscrollcommand=scrollbar.set)
+
+            result_text_box.insert('1.0', result)
+            result_text_box.config(state=tk.DISABLED)
+
+            x_pos = result_window.winfo_pointerx() - result_window.winfo_rootx() + 10
+            y_pos = result_window.winfo_pointery() - result_window.winfo_rooty() + 10
+            result_window.geometry(f"+{x_pos}+{y_pos}")
+
+    def search_selected_text(self):
+        selected_text = self.text_box.selection_get()
+        result = self.perform_similarity_search(selected_text)
+        self.show_search_result(result)
+
+    def setup_hotkey_listener(self):
+        keyboard.add_hotkey('ctrl+c', self.handle_ctrl_c)
+
+    def handle_ctrl_c(self):
+        time.sleep(1)  # Delay for 1 second to allow copying text
+        clipboard_content = pyperclip.paste()
+        words = clipboard_content.split()
+        if len(words) >= 1:
+            section_query = words[0] if len(words) > 1 else None
+            topic_query = words[-1]
+            # Validate if the topic_query matches the pattern of a topic number
+            if not re.match(r'^\d+(\.\d+)*$', topic_query):
+                # Swap section_query and topic_query if topic_query doesn't match the pattern
+                section_query, topic_query = topic_query, section_query
+            print("Captured text:")
+            print(clipboard_content)
+            print(f"Section query: {section_query}")
+            print(f"Topic query: {topic_query}")
+            print("-----------------------")
+            if section_query:
+                section_text = self.perform_similarity_search(section_query)
+                topic_text = self.extract_topic_text(section_text, topic_query)
+            else:
+                topic_text = self.extract_topic_text_from_all_sections(topic_query)
+            self.show_search_result(topic_text)
+
+    def show_stored_sections(self):
+        sections_window = tk.Toplevel(self.root)
+        sections_window.title("Stored Sections")
+
+        text_box = tk.Text(sections_window, wrap='word')
+        text_box.pack(expand=True, fill='both')
+
+        for section_number, section_text in self.section_dict.items():
+            text_box.insert(tk.END, f"SECTION {section_number}\n{section_text}\n\n")
+
+        text_box.config(state=tk.DISABLED)
+
+    def show_context_menu(self, event):
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.context_menu.grab_release()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = PDFTextExtractorApp(root)
+    root.mainloop()
